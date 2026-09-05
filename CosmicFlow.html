@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Futuristic Space Particle Field</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: #000000;
+    overflow: hidden;
+  }
+  #scene {
+    display: block;
+    position: fixed;
+    inset: 0;
+    width: 100vw;
+    height: 100vh;
+    background: #000000;
+  }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<script>
+(function () {
+  "use strict";
+
+  /* =====================================================================
+     CONFIGURATION
+     ===================================================================== */
+  const PARTICLE_COUNT = 700;
+
+  const MIN_SPEED   = 0.45;
+  const MAX_SPEED   = 1.4;
+  const MAX_DEPTH   = 2000;   // furthest Z a particle can spawn at
+  const NEAR_PLANE  = 1;      // recycle once a particle passes this
+  const PERSPECTIVE = 620;    // focal length for projection
+
+  // Particle spatial spread (gaussian around the centre in world space)
+  const SPREAD_X = 1700;
+  const SPREAD_Y = 1700;
+
+  // Uniform star size (all particles render at this radius, in CSS px).
+  // Depth is now conveyed by brightness and trails rather than size.
+  const PARTICLE_SIZE = 1.5;
+
+  // Fraction of stars that carry a persistent trail (chosen at random)
+  const TRAIL_CHANCE = 0.14;
+
+  // Glitter / twinkle
+  const TWINKLE_ENABLED = true;
+  const TWINKLE_CHANCE  = 0.20;   // reference tuning value
+  const SPARKLE_CHANCE  = 0.025;  // fraction of particles allowed to burst-sparkle
+  const MAX_SPARKLES    = 7;      // never more than this many bursts at once
+  const SPARKLE_TRIGGER = 0.0035; // per-frame chance a sparkle-capable star fires
+  const SPARKLE_LIFE    = 2.8;    // seconds per sparkle burst (slow, gentle swell)
+
+  // Shooting stars (random streaks at random times / places)
+  const METEOR_ENABLED  = true;
+  const METEOR_MIN_GAP  = 2.8;    // min seconds between streaks
+  const METEOR_MAX_GAP  = 9.0;    // max seconds between streaks
+  const METEOR_MAX_LIVE = 3;      // never more than this many on screen at once
+  const METEOR_MIN_SPEED = 480;   // px / second
+  const METEOR_MAX_SPEED = 950;
+  const METEOR_MIN_LEN  = 90;     // trail length in px
+  const METEOR_MAX_LEN  = 240;
+  const METEOR_POOL     = 5;
+
+  // Palette
+  const C_PARTICLE = [205, 225, 235]; // cool blue-white (base)
+  const C_ENERGY   = [80, 190, 255];  // cyan / futuristic blue
+
+  // Star colour-temperature range for natural variety (stays cool/restrained)
+  const C_WARM = [228, 226, 220]; // faint warm white
+  const C_COOL = [188, 214, 240]; // cool blue-white
+
+  /* =====================================================================
+     STATE
+     ===================================================================== */
+  const canvas = document.getElementById("scene");
+  const ctx = canvas.getContext("2d");
+
+  let dpr = 1;
+  let viewW = 0;      // CSS pixel width
+  let viewH = 0;      // CSS pixel height
+  let centerX = 0;
+  let centerY = 0;
+
+  let particles = [];
+  let activeSparkles = 0;
+  let lastTime = 0;
+
+  let meteors = [];
+  let activeMeteors = 0;
+  let nextMeteorAt = 0;
+
+  /* =====================================================================
+     HELPERS
+     ===================================================================== */
+  function random(min, max) {
+    return min + Math.random() * (max - min);
+  }
+
+  // Gaussian-ish value in roughly [-1, 1], concentrated near 0.
+  function gaussianUnit() {
+    // average of two uniforms -> triangular; a touch of a third softens tails
+    return ((Math.random() + Math.random() + Math.random()) / 3) * 2 - 1;
+  }
+
+  function rgba(c, a) {
+    return "rgba(" + c[0] + "," + c[1] + "," + c[2] + "," + a + ")";
+  }
+
+  /* =====================================================================
+     RESIZE  (high-DPI aware, keeps aspect ratio undistorted)
+     ===================================================================== */
+  function resize() {
+    // Full high-resolution: honour the device pixel ratio (capped at 3 so
+    // 4K / retina phones stay crisp without wasting GPU beyond the point of
+    // visible return).
+    dpr = Math.min(window.devicePixelRatio || 1, 3);
+    viewW = window.innerWidth;
+    viewH = window.innerHeight;
+
+    canvas.width  = Math.round(viewW * dpr);
+    canvas.height = Math.round(viewH * dpr);
+    canvas.style.width  = viewW + "px";
+    canvas.style.height = viewH + "px";
+
+    // Work in CSS-pixel coordinates; DPR handled by the transform.
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+
+    centerX = viewW / 2;
+    centerY = viewH / 2;
+  }
+
+  /* =====================================================================
+     PARTICLE CREATION / RESET
+     ===================================================================== */
+  function assignTwinkleProfile(p) {
+    const roll = Math.random();
+
+    // twinkleAmount = how far brightness can wander from baseline
+    // twGap        = how often (sec) it picks a new target -> flicker cadence
+    // twTau        = smoothing time constant -> how gently it eases there
+    if (roll < 0.75) {
+      // ~75%: effectively stable, barely-there breathing
+      p.twinkleAmount = random(0.0, 0.05);
+      p.twGapMin = 3.2; p.twGapMax = 7.5;
+      p.twTau = random(1.3, 2.6);
+      p.twinkleProbability = 0.02;
+      p.canSparkle = false;
+    } else if (roll < 0.90) {
+      // ~15%: subtle twinkle
+      p.twinkleAmount = random(0.08, 0.18);
+      p.twGapMin = 1.8; p.twGapMax = 4.6;
+      p.twTau = random(0.9, 1.8);
+      p.twinkleProbability = 0.10;
+      p.canSparkle = false;
+    } else if (roll < 0.965) {
+      // ~6.5%: noticeable, but still slow scintillation
+      p.twinkleAmount = random(0.22, 0.38);
+      p.twGapMin = 1.1; p.twGapMax = 2.8;
+      p.twTau = random(0.55, 1.1);
+      p.twinkleProbability = 0.30;
+      p.canSparkle = false;
+    } else {
+      // ~3.5%: brightest, slightly livelier stars, still eligible for rare sparkles
+      p.twinkleAmount = random(0.30, 0.45);
+      p.twGapMin = 0.9; p.twGapMax = 2.2;
+      p.twTau = random(0.45, 0.9);
+      p.twinkleProbability = 0.50;
+      p.canSparkle = Math.random() < (SPARKLE_CHANCE / 0.035); // gate by config
+    }
+
+    p.baseBrightness = random(0.55, 0.95);
+
+    // random-walk state (organic, non-repeating shimmer)
+    p.twOffset = 0;                       // current brightness offset
+    p.twTarget = 0;                       // offset it's easing toward
+    p.twTimer  = random(0, p.twGapMax);   // desync so nothing pulses together
+
+    // pure white stars
+    p.tint = [255, 255, 255];
+  }
+
+  // Populate a particle. `deep` = true forces a far spawn (used on recycle
+  // so stars appear to stream in from the distance).
+  function createParticle(p, deep) {
+    if (!p) p = {};
+
+    p.x = gaussianUnit() * SPREAD_X;
+    p.y = gaussianUnit() * SPREAD_Y;
+    p.z = deep ? random(MAX_DEPTH * 0.85, MAX_DEPTH)
+               : random(NEAR_PLANE + 20, MAX_DEPTH);
+
+    p.speed = random(MIN_SPEED, MAX_SPEED);
+
+    // previous projected screen position (for trails)
+    p.hasPrev = false;
+    p.px = 0;
+    p.py = 0;
+
+    // sparkle burst state
+    p.sparkleT = 0;   // 0 = inactive, otherwise remaining life in seconds
+    p.wasSparkling = false;
+
+    // a random subset of stars carry a persistent elegant trail,
+    // independent of how close they are to the camera
+    if (Math.random() < TRAIL_CHANCE) {
+      p.trail = true;
+      p.trailStrength = random(0.45, 1.0);
+    } else {
+      p.trail = false;
+      p.trailStrength = 0;
+    }
+
+    assignTwinkleProfile(p);
+    return p;
+  }
+
+  /* =====================================================================
+     PROJECTION (3D perspective -> 2D screen)
+     ===================================================================== */
+  function project(x, y, z) {
+    const scale = PERSPECTIVE / z;
+    return {
+      x: centerX + x * scale,
+      y: centerY + y * scale,
+      scale: scale
+    };
+  }
+
+  /* =====================================================================
+     CENTRAL ENERGY CORE  (removed — background is pure pitch black)
+     ===================================================================== */
+  function drawEnergyCore(time) {
+    // Intentionally empty: no central glow, so #000000 stays truly black.
+  }
+
+  /* =====================================================================
+     TWINKLE / SPARKLE UPDATE  (per-particle brightness factor)
+     ===================================================================== */
+  function updateTwinkle(p, time, dt) {
+    let bright = p.baseBrightness;
+
+    if (TWINKLE_ENABLED) {
+      // Organic scintillation: a smoothed random walk. Every so often the
+      // star picks a new brightness target (usually near baseline, rarely a
+      // bigger excursion) and eases toward it. No periodicity, so it never
+      // reads as a mechanical blink.
+      p.twTimer -= dt;
+      if (p.twTimer <= 0) {
+        const r = Math.random();
+        const mag = r * r * p.twinkleAmount;      // squared -> mostly small dips
+        // brighten a touch more readily than it dims (stars flare, not fade)
+        p.twTarget = (Math.random() < 0.45 ? -mag : mag * 1.25);
+        p.twTimer = random(p.twGapMin, p.twGapMax);
+      }
+      // frame-rate-independent easing toward the current target
+      const k = 1 - Math.exp(-dt / p.twTau);
+      p.twOffset += (p.twTarget - p.twOffset) * k;
+      bright += p.twOffset;
+    }
+
+    // ---- rare sparkle bursts ----
+    let sparkle = 0; // 0..1 extra intensity
+
+    if (p.sparkleT > 0) {
+      p.sparkleT -= dt;
+      if (p.sparkleT <= 0) {
+        p.sparkleT = 0;
+        if (p.wasSparkling) {
+          activeSparkles = Math.max(0, activeSparkles - 1);
+          p.wasSparkling = false;
+        }
+      } else {
+        // smooth rise-and-fall across the burst life
+        const progress = 1 - (p.sparkleT / SPARKLE_LIFE);
+        sparkle = Math.sin(progress * Math.PI);
+      }
+    } else if (
+      TWINKLE_ENABLED &&
+      p.canSparkle &&
+      activeSparkles < MAX_SPARKLES &&
+      Math.random() < SPARKLE_TRIGGER
+    ) {
+      p.sparkleT = SPARKLE_LIFE;
+      p.wasSparkling = true;
+      activeSparkles++;
+    }
+
+    if (bright < 0) bright = 0;
+    if (bright > 1.2) bright = 1.2;
+
+    p.brightness = bright;
+    p.sparkle = sparkle;
+  }
+
+  /* =====================================================================
+     TRAIL  (short, elegant, stronger only on close particles)
+     ===================================================================== */
+  function drawStarTrail(sx, sy, p, closeness, alpha) {
+    if (!p.hasPrev) return;
+
+    let trailAlpha, widthScale;
+
+    if (p.trail) {
+      // randomly-chosen trail stars: visible at any depth, scaled by their
+      // own strength and a gentle depth boost
+      trailAlpha = alpha * (0.35 + closeness * 0.5) * p.trailStrength;
+      widthScale = (0.6 + closeness * 1.4) * p.trailStrength;
+    } else {
+      // ordinary stars only streak when close to the camera
+      if (closeness < 0.18) return;
+      trailAlpha = alpha * closeness * 0.55;
+      widthScale = closeness * 1.8;
+    }
+
+    if (trailAlpha <= 0.01) return;
+
+    const grad = ctx.createLinearGradient(p.px, p.py, sx, sy);
+    grad.addColorStop(0, rgba(p.tint, 0));
+    grad.addColorStop(1, rgba(p.tint, trailAlpha));
+
+    ctx.strokeStyle = grad;
+    ctx.lineWidth = Math.max(0.5, widthScale);
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(p.px, p.py);
+    ctx.lineTo(sx, sy);
+    ctx.stroke();
+  }
+
+  /* =====================================================================
+     DRAW A SINGLE PARTICLE (dot + optional sparkle glow)
+     ===================================================================== */
+  function drawParticle(sx, sy, size, alpha, p, closeness) {
+    // core dot
+    ctx.fillStyle = rgba(p.tint, Math.min(1, alpha));
+    ctx.beginPath();
+    ctx.arc(sx, sy, size, 0, Math.PI * 2);
+    ctx.fill();
+
+    if (p.sparkle > 0.02) {
+      // ease the burst so it swells and fades gently rather than snapping
+      const s = p.sparkle * p.sparkle;
+
+      // soft round white glow only — no spikes, no colour
+      const glowR = size * (3 + s * 4.5);
+      const g = ctx.createRadialGradient(sx, sy, 0, sx, sy, glowR);
+      g.addColorStop(0, "rgba(255,255,255," + (0.42 * s) + ")");
+      g.addColorStop(0.4, "rgba(255,255,255," + (0.16 * s) + ")");
+      g.addColorStop(1, "rgba(255,255,255,0)");
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(sx, sy, glowR, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  /* =====================================================================
+     UPDATE PARTICLE POSITION (move toward viewer, recycle when needed)
+     ===================================================================== */
+  function updateParticle(p, dtScale) {
+    p.z -= p.speed * dtScale;
+
+    if (p.z <= NEAR_PLANE) {
+      createParticle(p, true);
+      return false; // recycled: skip drawing this frame
+    }
+    return true;
+  }
+
+  /* =====================================================================
+     SHOOTING STARS  (random streaks, random times, random places)
+     ===================================================================== */
+  function spawnMeteor() {
+    if (activeMeteors >= METEOR_MAX_LIVE) return;
+
+    // find a free slot in the pool
+    let m = null;
+    for (let i = 0; i < meteors.length; i++) {
+      if (!meteors[i].active) { m = meteors[i]; break; }
+    }
+    if (!m) return;
+
+    // Random start anywhere in the upper / mid region of the screen.
+    m.x = random(-viewW * 0.1, viewW * 1.1);
+    m.y = random(-viewH * 0.05, viewH * 0.55);
+
+    // Mostly downward-diagonal, either direction, shallow-to-medium angle.
+    const dir = Math.random() < 0.5 ? -1 : 1;
+    const angle = random(Math.PI * 0.12, Math.PI * 0.38); // below horizontal
+    const speed = random(METEOR_MIN_SPEED, METEOR_MAX_SPEED);
+    m.vx = Math.cos(angle) * speed * dir;
+    m.vy = Math.sin(angle) * speed;
+
+    m.len   = random(METEOR_MIN_LEN, METEOR_MAX_LEN);
+    m.width = random(1.1, 2.2);
+    m.maxLife = random(0.7, 1.5);
+    m.life  = m.maxLife;
+    m.active = true;
+    activeMeteors++;
+  }
+
+  function updateMeteors(time, dt) {
+    if (!METEOR_ENABLED) return;
+
+    if (time >= nextMeteorAt) {
+      spawnMeteor();
+      nextMeteorAt = time + random(METEOR_MIN_GAP, METEOR_MAX_GAP);
+    }
+
+    for (let i = 0; i < meteors.length; i++) {
+      const m = meteors[i];
+      if (!m.active) continue;
+
+      m.x += m.vx * dt;
+      m.y += m.vy * dt;
+      m.life -= dt;
+
+      // retire when spent or well off-screen
+      if (
+        m.life <= 0 ||
+        m.x < -m.len - viewW * 0.2 || m.x > viewW + m.len + viewW * 0.2 ||
+        m.y > viewH + m.len + viewH * 0.2
+      ) {
+        m.active = false;
+        activeMeteors = Math.max(0, activeMeteors - 1);
+      }
+    }
+  }
+
+  function drawMeteors() {
+    if (!METEOR_ENABLED) return;
+    ctx.globalCompositeOperation = "lighter";
+    ctx.lineCap = "round";
+
+    for (let i = 0; i < meteors.length; i++) {
+      const m = meteors[i];
+      if (!m.active) continue;
+
+      // smooth in/out envelope so it appears and fades naturally
+      const progress = 1 - m.life / m.maxLife;
+      const env = Math.sin(progress * Math.PI);
+      if (env <= 0.01) continue;
+
+      // tail sits behind the head along the travel direction
+      const sp = Math.hypot(m.vx, m.vy) || 1;
+      const ux = m.vx / sp, uy = m.vy / sp;
+      const tailX = m.x - ux * m.len;
+      const tailY = m.y - uy * m.len;
+
+      // streak
+      const grad = ctx.createLinearGradient(tailX, tailY, m.x, m.y);
+      grad.addColorStop(0, "rgba(255,255,255,0)");
+      grad.addColorStop(0.7, "rgba(255,255,255," + (0.28 * env) + ")");
+      grad.addColorStop(1, "rgba(255,255,255," + (0.9 * env) + ")");
+      ctx.strokeStyle = grad;
+      ctx.lineWidth = m.width;
+      ctx.beginPath();
+      ctx.moveTo(tailX, tailY);
+      ctx.lineTo(m.x, m.y);
+      ctx.stroke();
+
+      // soft glowing head
+      const headR = m.width * 3.2;
+      const hg = ctx.createRadialGradient(m.x, m.y, 0, m.x, m.y, headR);
+      hg.addColorStop(0, "rgba(255,255,255," + (0.9 * env) + ")");
+      hg.addColorStop(0.4, "rgba(255,255,255," + (0.3 * env) + ")");
+      hg.addColorStop(1, "rgba(255,255,255,0)");
+      ctx.fillStyle = hg;
+      ctx.beginPath();
+      ctx.arc(m.x, m.y, headR, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  /* =====================================================================
+     INITIALIZE
+     ===================================================================== */
+  function initialize() {
+    resize();
+    particles = new Array(PARTICLE_COUNT);
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+      particles[i] = createParticle(null, false);
+    }
+
+    meteors = new Array(METEOR_POOL);
+    for (let i = 0; i < METEOR_POOL; i++) {
+      meteors[i] = { active: false };
+    }
+    activeMeteors = 0;
+    nextMeteorAt = random(METEOR_MIN_GAP, METEOR_MAX_GAP);
+
+    lastTime = performance.now();
+  }
+
+  /* =====================================================================
+     ANIMATION LOOP
+     ===================================================================== */
+  function animate(now) {
+    const time = now * 0.001;             // seconds
+    let dt = (now - lastTime) * 0.001;    // delta seconds
+    if (dt > 0.05) dt = 0.05;             // clamp after tab-switches
+    lastTime = now;
+    const dtScale = dt * 60;              // normalise motion to 60fps
+
+    // clear to solid black
+    ctx.globalCompositeOperation = "source-over";
+    ctx.fillStyle = "#000000";
+    ctx.fillRect(0, 0, viewW, viewH);
+
+    // background energy field (whisper-faint; no rings)
+    drawEnergyCore(time);
+
+    // advance shooting stars
+    updateMeteors(time, dt);
+
+    // stars (additive so overlaps glow softly)
+    ctx.globalCompositeOperation = "lighter";
+
+    const margin = 60;
+
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+      const p = particles[i];
+
+      const alive = updateParticle(p, dtScale);
+      if (!alive) continue;
+
+      const proj = project(p.x, p.y, p.z);
+
+      // recycle if it has drifted well outside the viewport
+      if (
+        proj.x < -margin || proj.x > viewW + margin ||
+        proj.y < -margin || proj.y > viewH + margin
+      ) {
+        createParticle(p, true);
+        continue;
+      }
+
+      // closeness: 0 (far) -> 1 (near camera)
+      const closeness = 1 - p.z / MAX_DEPTH;
+      // eased fade -> distant stars sink softly into the black
+      const fade = closeness * closeness;
+
+      updateTwinkle(p, time, dt);
+
+      // uniform size for every star; depth shows through brightness + trails
+      let size = PARTICLE_SIZE;
+      let alpha = (0.06 + fade * 0.9) * p.brightness;
+
+      if (p.sparkle > 0) {
+        size  *= 1 + p.sparkle * 0.5; // slight swell only during a sparkle
+        alpha += p.sparkle * 0.6;
+      }
+
+      drawStarTrail(proj.x, proj.y, p, closeness, alpha);
+      drawParticle(proj.x, proj.y, size, alpha, p, closeness);
+
+      // store screen position for next frame's trail
+      p.px = proj.x;
+      p.py = proj.y;
+      p.hasPrev = true;
+    }
+
+    // shooting stars render above the field
+    drawMeteors();
+
+    ctx.globalCompositeOperation = "source-over";
+    requestAnimationFrame(animate);
+  }
+
+  /* =====================================================================
+     EVENTS + START
+     ===================================================================== */
+  let resizeRAF = null;
+  window.addEventListener("resize", function () {
+    if (resizeRAF) cancelAnimationFrame(resizeRAF);
+    resizeRAF = requestAnimationFrame(resize);
+  }, { passive: true });
+
+  window.addEventListener("orientationchange", resize);
+
+  initialize();
+  requestAnimationFrame(animate);
+})();
+</script>
+</body>
+</html>
