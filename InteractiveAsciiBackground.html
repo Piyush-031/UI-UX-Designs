@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Futuristic ASCII Flow</title>
+<style>
+:root{
+  --accent:82,39,255;          /* light theme: electric indigo */
+  --bg:#fafafa;
+  --fg:20,20,20;
+}
+.dark{
+  --accent:0,229,255;          /* dark theme: cyan */
+  --bg:#080808;
+  --fg:245,245,245;
+}
+*{box-sizing:border-box}
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:var(--bg)}
+body{font-family:monospace}
+
+#asciiBackground{
+  position:fixed;inset:0;width:100vw;height:100vh;display:block;
+  opacity:0;transition:opacity .9s ease
+}
+body.ready #asciiBackground{opacity:1}
+
+/* Vignette: focuses the eye toward center */
+.vignette{
+  position:fixed;inset:0;z-index:5;pointer-events:none;opacity:0;
+  transition:opacity 1.2s ease;
+  background:radial-gradient(ellipse 120% 120% at 50% 50%,
+    transparent 55%, rgba(0,0,0,.22) 100%)
+}
+.dark .vignette{
+  background:radial-gradient(ellipse 120% 120% at 50% 50%,
+    transparent 50%, rgba(0,0,0,.55) 100%)
+}
+body.ready .vignette{opacity:1}
+
+/* Corner brackets: reticle / HUD frame */
+.corner{
+  position:fixed;z-index:8;width:26px;height:26px;pointer-events:none;
+  border:1px solid rgba(var(--accent),.45);opacity:0;
+  transition:opacity 1s ease .2s
+}
+body.ready .corner{opacity:1}
+.corner.tr{right:14px;top:14px;border-left:0;border-bottom:0}
+.corner.bl{left:14px;bottom:14px;border-right:0;border-top:0}
+.corner.br{right:14px;bottom:14px;border-left:0;border-top:0}
+
+/* Command-line input */
+.controls{
+  position:fixed;z-index:20;left:50%;bottom:26px;transform:translateX(-50%);
+  width:min(560px,calc(100vw - 40px));
+  display:flex;align-items:center;
+  border:1px solid rgba(var(--fg),.25);border-radius:2px;
+  background:rgba(var(--bg-solid,255,255,255),.72);
+  backdrop-filter:blur(8px);
+  transition:border-color .2s ease, box-shadow .2s ease
+}
+.dark .controls{background:rgba(8,8,8,.72)}
+.controls:focus-within{
+  border-color:rgba(var(--accent),.8);
+  box-shadow:0 0 0 1px rgba(var(--accent),.25), 0 0 18px rgba(var(--accent),.18)
+}
+.prompt{
+  padding-left:14px;color:rgb(var(--accent));font:15px monospace;
+  user-select:none;flex:0 0 auto
+}
+.cursor{
+  width:8px;height:16px;margin-left:2px;flex:0 0 auto;
+  background:rgb(var(--accent));animation:blink 1.06s steps(1) infinite
+}
+.controls:focus-within .cursor,
+.controls.filled .cursor{display:none}
+@keyframes blink{0%,49%{opacity:1}50%,100%{opacity:0}}
+#formationText{
+  flex:1 1 auto;min-width:0;
+  padding:13px 44px 13px 8px;border:0;background:transparent;
+  color:rgb(var(--fg));outline:0;caret-color:rgb(var(--accent));
+  font:15px monospace;letter-spacing:.5px
+}
+#formationText::placeholder{color:rgba(var(--fg),.4);letter-spacing:1.4px}
+#clear{
+  position:absolute;right:8px;top:50%;transform:translateY(-50%);
+  border:0;background:transparent;font:22px monospace;cursor:pointer;
+  color:rgba(var(--fg),.5);line-height:1;padding:2px 6px
+}
+#clear:hover{color:rgb(var(--accent))}
+
+#theme{
+  position:fixed;right:52px;top:14px;z-index:20;
+  border:1px solid rgba(var(--fg),.3);border-radius:2px;
+  background:rgba(var(--bg-solid,255,255,255),.6);
+  padding:7px 12px;cursor:pointer;font:10px monospace;letter-spacing:1.5px;
+  color:rgba(var(--fg),.8);transition:border-color .2s,color .2s
+}
+.dark #theme{background:rgba(8,8,8,.6)}
+#theme:hover{border-color:rgba(var(--accent),.7);color:rgb(var(--accent))}
+</style>
+</head>
+<body>
+<canvas id="asciiBackground"></canvas>
+<div class="vignette"></div>
+
+<span class="corner tr"></span>
+<span class="corner bl"></span>
+<span class="corner br"></span>
+
+<button id="theme">DARK</button>
+
+<div class="controls" id="controls">
+  <span class="prompt">&gt;</span>
+  <span class="cursor"></span>
+  <input id="formationText" maxlength="80" placeholder="ENTER TEXT TO FORM..." autocomplete="off">
+  <button id="clear" aria-label="Clear">×</button>
+</div>
+
+<script>
+(function(){
+"use strict";
+
+const canvas=document.getElementById("asciiBackground");
+const ctx=canvas.getContext("2d");
+const input=document.getElementById("formationText");
+const controls=document.getElementById("controls");
+const clear=document.getElementById("clear");
+const theme=document.getElementById("theme");
+
+const RM = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+const TSCALE = RM ? 0.22 : 1;      // slow the clock for reduced motion
+
+let W=window.innerWidth, H=window.innerHeight;
+const CELL_W=12, CELL_H=15;
+const CHARS="$01/\\|<>+-=?[](){}~";
+let dpr=1;
+let mouse={x:-99999,y:-99999};
+let targetMouse={x:-99999,y:-99999};
+let entered="";
+let textMask=null;
+let maskW=0,maskH=0;
+let startTime=performance.now();
+let textTime=-9999;
+
+// spatial grid over the text mask for O(1)-ish nearest lookups
+let maskGrid=null, GC=44, gCols=0, gRows=0;
+
+function clock(){ return (performance.now()-startTime)/1000*TSCALE; }
+function accentRGBA(a){ return "rgba("+ACCENT+","+a+")"; }
+let ACCENT="82,39,255", FG="20,20,20";
+
+function resize(){
+  W=window.innerWidth; H=window.innerHeight;
+
+  // Resolution-adaptive: keep text crisp on soft (dpr 1) displays by
+  // supersampling, honor high-DPI up to 3x, but cap the longest buffer
+  // edge near 4K so fill cost never explodes.
+  let base=window.devicePixelRatio||1;
+  if(base<1.5) base=1.5;
+  let d=Math.min(base,3);
+  const MAX_EDGE=4096;
+  const longest=Math.max(W,H)*d;
+  if(longest>MAX_EDGE) d=MAX_EDGE/Math.max(W,H);
+  dpr=Math.max(1,d);
+
+  canvas.width=Math.round(W*dpr);
+  canvas.height=Math.round(H*dpr);
+  canvas.style.width="100vw";
+  canvas.style.height="100vh";
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+window.addEventListener("resize",resize);
+
+function hash(x,y){
+  const n=Math.sin(x*127.1+y*311.7)*43758.5453123;
+  return n-Math.floor(n);
+}
+function noise(x,y){
+  const x0=Math.floor(x),y0=Math.floor(y);
+  const xf=x-x0,yf=y-y0;
+  const a=hash(x0,y0),b=hash(x0+1,y0);
+  const c=hash(x0,y0+1),d=hash(x0+1,y0+1);
+  const u=xf*xf*(3-2*xf),v=yf*yf*(3-2*yf);
+  return a+(b-a)*u+(c-a)*v+(a-b-c+d)*u*v;
+}
+
+function buildTextMask(){
+  entered=input.value.trim();
+  controls.classList.toggle("filled", entered.length>0);
+  if(!entered){textMask=null;maskGrid=null;return}
+
+  const c=document.createElement("canvas");
+  c.width=2200;c.height=520;
+  const x=c.getContext("2d");
+  x.fillStyle="#fff";
+  let size=Math.min(330,Math.max(70,3000/Math.max(8,entered.length)));
+  x.font="bold "+size+"px monospace";
+  x.textAlign="center";x.textBaseline="middle";
+  while(x.measureText(entered).width>2050 && size>35){
+    size-=4;x.font="bold "+size+"px monospace";
+  }
+  x.fillText(entered,1100,260);
+
+  const data=x.getImageData(0,0,c.width,c.height).data;
+  const step=7;
+  const pts=[];
+  for(let y=0;y<c.height;y+=step){
+    for(let xx=0;xx<c.width;xx+=step){
+      if(data[(y*c.width+xx)*4+3]>100) pts.push([xx,y]);
+    }
+  }
+  textMask=pts;maskW=2200;maskH=520;textTime=clock();
+  buildMaskGrid();
+}
+
+function buildMaskGrid(){
+  if(!textMask||!textMask.length){maskGrid=null;return}
+  gCols=Math.ceil(maskW/GC)+1;
+  gRows=Math.ceil(maskH/GC)+1;
+  maskGrid=new Array(gCols*gRows);
+  for(let i=0;i<textMask.length;i++){
+    const p=textMask[i];
+    const k=Math.floor(p[1]/GC)*gCols+Math.floor(p[0]/GC);
+    (maskGrid[k]||(maskGrid[k]=[])).push(p);
+  }
+}
+
+function textLayout(t){
+  const scale=Math.min(W/maskW,(H*0.44)/maskH);
+  const tw=maskW*scale, th=maskH*scale;
+  const driftX=Math.sin(t*.20)*W*0.031;
+  const driftY=Math.cos(t*.17)*H*0.016;
+  return {scale,tw,th,left:(W-tw)/2+driftX,top:(H-th)/2+driftY};
+}
+
+function textInfluence(px,py,t){
+  if(!maskGrid) return 0;
+  const L=textLayout(t);
+  const lx=(px-L.left)/L.scale;
+  const ly=(py-L.top)/L.scale;
+  if(lx<-80||ly<-80||lx>maskW+80||ly>maskH+80) return 0;
+  const cx=Math.floor(lx/GC), cy=Math.floor(ly/GC);
+  let best=1e9;
+  for(let gy=cy-1;gy<=cy+1;gy++){
+    if(gy<0||gy>=gRows)continue;
+    for(let gx=cx-1;gx<=cx+1;gx++){
+      if(gx<0||gx>=gCols)continue;
+      const bucket=maskGrid[gy*gCols+gx];
+      if(!bucket)continue;
+      for(let i=0;i<bucket.length;i++){
+        const dx=bucket[i][0]-lx, dy=bucket[i][1]-ly;
+        const d=dx*dx+dy*dy;
+        if(d<best)best=d;
+      }
+    }
+  }
+  return Math.max(0,1-Math.sqrt(best)*L.scale/(Math.min(W,H)*0.05));
+}
+
+function draw(){
+  const t=clock();
+
+  mouse.x+=(targetMouse.x-mouse.x)*.08;
+  mouse.y+=(targetMouse.y-mouse.y)*.08;
+
+  const dark=document.body.classList.contains("dark");
+  FG=dark?"245,245,245":"20,20,20";
+  ACCENT=dark?"0,229,255":"82,39,255";
+  const fg="rgba("+FG+",";
+
+  // Clean full clear every frame — uniform field, no motion trails.
+  ctx.fillStyle=dark?"#080808":"#fafafa";
+  ctx.fillRect(0,0,W,H);
+
+  const U=Math.min(W,H);
+  const cols=Math.ceil(W/CELL_W);
+  const rows=Math.ceil(H/CELL_H);
+
+  // Word lifecycle: assemble -> hold -> scatter -> dispersed gap -> repeat.
+  let txtAppear=1, txtScatter=0, txtGap=false;
+  if(maskGrid){
+    const age=t-textTime;
+    if(RM){ txtAppear=1; txtScatter=0; }
+    else{
+      const A=1.2, HOLD=3.6, S=2.4, G=0.8, CYCLE=A+HOLD+S+G;
+      let ph=age%CYCLE; if(ph<0) ph+=CYCLE;
+      if(ph<A){ const p=ph/A; txtAppear=p*p*(3-2*p); txtScatter=0; }
+      else if(ph<A+HOLD){ txtAppear=1; txtScatter=0; }
+      else if(ph<A+HOLD+S){ txtAppear=1; const s=(ph-A-HOLD)/S; txtScatter=s*s*(3-2*s); }
+      else { txtAppear=1; txtScatter=1; txtGap=true; }
+    }
+  }
+  const textStrength = maskGrid ? txtAppear*(1-txtScatter) : 0;
+
+  ctx.font="11px monospace";
+  ctx.textAlign="center";
+  ctx.textBaseline="middle";
+
+  for(let row=0;row<rows;row++){
+    for(let col=0;col<cols;col++){
+      let x=col*CELL_W+CELL_W/2;
+      let y=row*CELL_H+CELL_H/2;
+
+      // Dense everywhere: overlapping waves prevent large blank regions.
+      const w1=Math.sin(col*.105+t*.22+Math.sin(row*.12)*1.8);
+      const w2=Math.sin(row*.15-col*.035-t*.16);
+      const w3=Math.sin((col+row)*.055-t*.12);
+      const n=noise(col*.075+t*.012,row*.075-t*.009);
+      let density=.62+.15*w1+.11*w2+.08*w3+.12*(n-.5);
+
+      // Gentle cursor field.
+      const md=Math.hypot(x-mouse.x,y-mouse.y);
+      const mr=U*0.44;
+      if(md<mr){
+        const q=1-md/mr;
+        const ang=Math.atan2(y-mouse.y,x-mouse.x);
+        x+=Math.cos(ang)*q*U*0.055+Math.sin(ang)*q*U*0.013;
+        y+=Math.sin(ang)*q*U*0.016;
+      }
+
+      const ti=textStrength>0.01 ? textInfluence(x,y,t)*textStrength : 0;
+
+      // Random coherent formations.
+      const f=Math.sin(col*.16+Math.sin(row*.08+t*.3)*2.4-t*.45)
+             +Math.sin(row*.19-col*.05+t*.27)
+             +Math.sin((col-row)*.075-t*.18)
+             +noise(col*.11+t*.02,row*.11-t*.015)*2-1;
+
+      let index=Math.floor(Math.abs(f*17+Math.floor(t*.32+hash(col,row)*9)))%CHARS.length;
+      let ch=CHARS[index];
+      let useAccent=false;
+
+      // Text formation is made entirely from ASCII characters.
+      if(ti>.05){
+        const textChars="$01/\\|<>+-=?[]{}~";
+        const s=Math.floor((f*20+ti*80+t*2+hash(col*7,row*11)*30));
+        ch=textChars[Math.abs(s)%textChars.length];
+        useAccent=true;
+      }
+
+      // Small organic displacement.
+      x+=Math.sin(row*.12+t*.7)*U*0.0032+Math.sin(col*.045-t*.5)*U*0.0023;
+      y+=Math.cos(col*.08-t*.55)*U*0.0019;
+
+      // Depth/parallax.
+      const depth=.82+.18*Math.sin(col*.06+row*.031+t*.13);
+      x+=(mouse.x>0?(mouse.x-W/2)*.006*depth:0);
+
+      const alpha=Math.max(.28,Math.min(.88,
+        .47+density*.32+ti*.28));
+
+      // Accent only touches text-formation glyphs; the field stays monochrome.
+      ctx.fillStyle=(useAccent?"rgba("+ACCENT+",":fg)+alpha+")";
+      ctx.fillText(ch,x,y);
+    }
+  }
+
+  // Dedicated text formation pass — guarantees the word reads clearly,
+  // assembled from ASCII symbols, while the field flows underneath.
+  // Loops assemble -> hold -> scatter -> reassemble via the shared phase.
+  if(maskGrid){
+    const appear=txtAppear, scatter=txtScatter;
+    const L=textLayout(t);
+
+    ctx.save();
+    ctx.font="bold 12px monospace";
+    ctx.textAlign="center";
+    ctx.textBaseline="middle";
+
+    for(let i=0;i<textMask.length;i+=2){
+      const p=textMask[i];
+      let x=L.left+p[0]*L.scale;
+      let y=L.top+p[1]*L.scale;
+
+      const seed=hash(i,Math.floor(entered.length*17.3));
+      const wave=Math.sin(t*1.8+p[0]*.018+p[1]*.011)*U*0.006;
+
+      const assemble=(1-appear);
+      x += (seed-.5)*W*0.13*assemble;
+      y += (hash(i,9.1)-.5)*H*0.12*assemble;
+
+      x += Math.cos(seed*6.283+t*.7)*W*0.06*scatter;
+      y += Math.sin(seed*6.283+t*.8)*H*0.07*scatter;
+      x += wave;
+
+      let alpha=(.82*appear)*(1-scatter*.9);
+      if(txtGap) alpha=0;
+      if(alpha>.03){
+        const chars="$01/\\|<>+-=?[]{}~";
+        const ci=Math.floor(seed*chars.length+t*.8+i)%chars.length;
+        ctx.fillStyle=accentRGBA(Math.max(.2,alpha));
+        ctx.fillText(chars[ci],x,y);
+      }
+    }
+    ctx.restore();
+  }
+
+  // Scan sweep — a soft gradient band rather than a hard bar.
+  const bandH=Math.max(30,H*0.055);
+  const sy=((t*90)%(H+bandH*3))-bandH*1.5;
+  const grad=ctx.createLinearGradient(0,sy-bandH,0,sy+bandH);
+  grad.addColorStop(0,accentRGBA(0));
+  grad.addColorStop(.5,accentRGBA(dark?.06:.05));
+  grad.addColorStop(1,accentRGBA(0));
+  ctx.fillStyle=grad;
+  ctx.fillRect(0,sy-bandH,W,bandH*2);
+
+  requestAnimationFrame(draw);
+}
+
+canvas.addEventListener("mousemove",function(e){
+  const r=canvas.getBoundingClientRect();
+  targetMouse.x=(e.clientX-r.left)*W/r.width;
+  targetMouse.y=(e.clientY-r.top)*H/r.height;
+});
+canvas.addEventListener("mouseleave",function(){
+  targetMouse.x=-99999;targetMouse.y=-99999;
+});
+canvas.addEventListener("click",function(){
+  textTime=clock();
+});
+
+// Touch: a finger drives the same cursor field on mobile.
+function touchMove(e){
+  if(!e.touches.length) return;
+  const tch=e.touches[0];
+  const r=canvas.getBoundingClientRect();
+  targetMouse.x=(tch.clientX-r.left)*W/r.width;
+  targetMouse.y=(tch.clientY-r.top)*H/r.height;
+  e.preventDefault();
+}
+canvas.addEventListener("touchstart",touchMove,{passive:false});
+canvas.addEventListener("touchmove",touchMove,{passive:false});
+canvas.addEventListener("touchend",function(){
+  targetMouse.x=-99999;targetMouse.y=-99999;
+});
+
+input.addEventListener("input",function(){ buildTextMask(); });
+input.addEventListener("change",function(){ buildTextMask(); });
+input.addEventListener("keydown",function(e){
+  if(e.key==="Enter"){ buildTextMask(); }
+  else if(e.key==="Escape"){ input.value=""; buildTextMask(); }
+});
+clear.addEventListener("click",function(){
+  input.value="";buildTextMask();input.focus();
+});
+theme.addEventListener("click",function(){
+  document.body.classList.toggle("dark");
+  theme.textContent=document.body.classList.contains("dark")?"LIGHT":"DARK";
+});
+
+resize();
+buildTextMask();
+requestAnimationFrame(draw);
+
+// Deliberate load fade-in.
+requestAnimationFrame(function(){
+  requestAnimationFrame(function(){ document.body.classList.add("ready"); });
+});
+})();
+</script>
+</body>
+</html>
